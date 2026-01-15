@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>MIDI Player – Fixed Timing</title>
+  <style>
+    body {
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      max-width: 720px;
+      margin: 40px auto;
+      padding: 20px;
+      background: #f9fafb;
+      color: #1f2937;
+    }
+    h1 { color: #111827; text-align: center; }
+    .container {
+      background: white;
+      padding: 30px;
+      border-radius: 12px;
+      box-shadow: 0 6px 20px rgba(0,0,0,0.1);
+    }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      margin: 25px 0;
+      justify-content: center;
+    }
+    button {
+      padding: 12px 32px;
+      font-size: 16px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.22s;
+      color: white;
+    }
+    #startAudioBtn { background: #3b82f6; }
+    #startAudioBtn:hover { background: #2563eb; }
+    #playBtn   { background: #10b981; }
+    #playBtn:hover   { background: #059669; }
+    #stopBtn   { background: #ef4444; }
+    #stopBtn:hover   { background: #dc2626; }
+    input[type="file"] {
+      margin: 20px auto;
+      display: block;
+    }
+    #status {
+      text-align: center;
+      margin: 20px 0;
+      font-weight: 500;
+      min-height: 1.5em;
+      color: #4b5563;
+    }
+    .info { 
+      text-align: center; 
+      color: #6b7280; 
+      font-size: 0.95em; 
+      margin-top: 30px; 
+    }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <h1>MIDI Player – Stable Timing</h1>
+    
+    <div style="text-align:center; margin-bottom:20px;">
+      <p>Web Audio API • basic waveform synth • no external libraries</p>
+    </div>
+
+    <div class="controls">
+      <button id="startAudioBtn">Start Audio (required)</button>
+      <button id="playBtn" disabled>Play</button>
+      <button id="stopBtn" disabled>Stop</button>
+    </div>
+
+    <div style="text-align:center;">
+      <input type="file" id="fileInput" accept=".mid,.midi" />
+    </div>
+
+    <div id="status">Ready – start audio first</div>
+  </div>
+
+  <div class="info">
+    Best in Chrome/Edge • Try classic MIDIs (Mario, Tetris, Zelda, Für Elise...)
+  </div>
+
+<script>
+// ────────────────────────────────────────────────
+// MIDI Player with improved drift-free scheduling
+// ────────────────────────────────────────────────
+
+class SimpleMidiPlayer {
+  constructor() {
+    this.audioContext = null;
+    this.tracks = [];
+    this.microsecondsPerBeat = 500000;
+    this.ticksPerBeat = 480;
+    this.playing = false;
+    this.startTime = 0;
+    this.instrument = 'sawtooth'; // sine | square | sawtooth | triangle
+  }
+
+  async initAudio() {
+    if (this.audioContext?.state === 'running') return true;
+    
+    this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    await this.audioContext.resume();
+    return this.audioContext.state === 'running';
+  }
+
+  async loadFile(file) {
+    if (!this.audioContext) {
+      alert("Click 'Start Audio' first!");
+      return false;
+    }
+
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const midi = this.parseMidi(arrayBuffer);
+      if (!midi) throw new Error("Invalid MIDI file");
+
+      this.tracks = midi.tracks;
+      this.ticksPerBeat = midi.header.ticksPerBeat || 480;
+      this.microsecondsPerBeat = 500000;
+
+      // Initialize event pointers for each track
+      for (const track of this.tracks) {
+        track.nextEventIndex = 0;
+      }
+
+      document.getElementById('status').textContent = 
+        `Loaded: ${this.tracks.length} tracks • ${this.ticksPerBeat} TPQN`;
+      document.getElementById('playBtn').disabled = false;
+      document.getElementById('stopBtn').disabled = false;
+      
+      return true;
+    } catch (err) {
+      document.getElementById('status').textContent = "Error: " + err.message;
+      console.error(err);
+      return false;
+    }
+  }
+
+  parseMidi(buffer) {
+    const view = new DataView(buffer);
+    let pos = 0;
+
+    const readString = len => {
+      let s = '';
+      for(let i=0; i<len; i++) s += String.fromCharCode(view.getUint8(pos++));
+      return s;
+    };
+
+    const readUint32 = () => { const v = view.getUint32(pos); pos+=4; return v; };
+    const readUint16 = () => { const v = view.getUint16(pos); pos+=2; return v; };
+
+    const readVarLen = () => {
+      let r = 0;
+      while(true){
+        const b = view.getUint8(pos++);
+        r = (r<<7) | (b&0x7f);
+        if(!(b&0x80)) break;
+      }
+      return r;
+    };
+
+    if(readString(4) !== 'MThd') throw new Error("Not a MIDI file");
+    readUint32(); // header length
+    const format = readUint16();
+    const nTracks = readUint16();
+    const division = readUint16();
+
+    if(division & 0x8000) throw new Error("SMPTE timing not supported");
+    const ticksPerBeat = division;
+
+    const tracks = [];
+    for(let t=0; t<nTracks; t++){
+      if(readString(4) !== 'MTrk') continue;
+      const len = readUint32();
+      const end = pos + len;
+      const events = [];
+      let time = 0;
+      let runningStatus = 0;
+
+      while(pos < end){
+        const delta = readVarLen();
+        time += delta;
+
+        let status = view.getUint8(pos);
+        if(status < 0x80){
+          status = runningStatus;
+          pos--;
+        } else {
+          runningStatus = status;
+          pos++;
+        }
+
+        const ev = {time, status};
+
+        if(status === 0xFF){ // meta
+          const metaType = view.getUint8(pos++);
+          const metaLen = readVarLen();
+          if(metaType === 0x51){ // Set Tempo
+            ev.tempo = (view.getUint8(pos)<<16) | (view.getUint8(pos+1)<<8) | view.getUint8(pos+2);
+          }
+          pos += metaLen;
+        }
+        else if((status & 0xF0) === 0x90 || (status & 0xF0) === 0x80){
+          ev.note = view.getUint8(pos++);
+          ev.velocity = view.getUint8(pos++);
+          ev.channel = status & 0x0F;
+          ev.type = ((status & 0xF0) === 0x80 || ev.velocity === 0) ? 'noteOff' : 'noteOn';
+        }
+        else {
+          const dataLen = this.getDataLen(status);
+          pos += dataLen;
+        }
+
+        if (ev.type || ev.tempo) events.push(ev);
+      }
+      tracks.push({events, nextEventIndex: 0});
+    }
+
+    return { header:{formatType:format, ticksPerBeat}, tracks };
+  }
+
+  getDataLen(status){
+    if((status&0xF0)===0xC0 || (status&0xF0)===0xD0) return 1;
+    if((status&0xF0)===0xE0 || (status&0xF0)===0xB0) return 2;
+    return 0;
+  }
+
+  play() {
+    if (this.playing || !this.tracks.length) return;
+    this.playing = true;
+    this.startTime = this.audioContext.currentTime;
+
+    // Reset pointers
+    for (const track of this.tracks) {
+      track.nextEventIndex = 0;
+    }
+
+    this.schedule();
+  }
+
+  stop() {
+    this.playing = false;
+    // Release all active notes
+    for (const gain of this.gainNodes?.values() || []) {
+      gain.gain.cancelScheduledValues(this.audioContext.currentTime);
+      gain.gain.linearRampToValueAtTime(0, this.audioContext.currentTime + 0.12);
+    }
+    this.gainNodes?.clear();
+  }
+
+  schedule(lookahead = 0.12) {
+    if (!this.playing) return;
+
+    const now = this.audioContext.currentTime;
+    const deadline = now + lookahead;
+    const secPerTick = this.microsecondsPerBeat / 1_000_000 / this.ticksPerBeat;
+
+    for (const track of this.tracks) {
+      while (track.nextEventIndex < track.events.length) {
+        const ev = track.events[track.nextEventIndex];
+        const evTime = this.startTime + ev.time * secPerTick;
+
+        if (evTime > deadline) break;
+
+        if (ev.type === 'noteOn' && ev.velocity > 0) {
+          this.playNote(ev.note, ev.velocity, ev.channel, evTime);
+        }
+        else if (ev.type === 'noteOff' || (ev.type === 'noteOn' && ev.velocity === 0)) {
+          this.releaseNote(ev.note, ev.channel, evTime);
+        }
+        else if (ev.tempo) {
+          this.microsecondsPerBeat = ev.tempo;
+        }
+
+        track.nextEventIndex++;
+      }
+    }
+
+    setTimeout(() => this.schedule(lookahead), 28);
+  }
+
+  playNote(note, velocity, channel, when) {
+    const freq = 440 * Math.pow(2, (note - 69) / 12);
+
+    const osc = this.audioContext.createOscillator();
+    osc.type = this.instrument;
+    osc.frequency.setValueAtTime(freq, when);
+
+    const gain = this.audioContext.createGain();
+    gain.gain.setValueAtTime(0, when);
+    gain.gain.linearRampToValueAtTime(velocity/127 * 0.38, when + 0.012);
+    gain.gain.linearRampToValueAtTime(velocity/127 * 0.11, when + 0.45);
+
+    osc.connect(gain);
+    gain.connect(this.audioContext.destination);
+
+    osc.start(when);
+    osc.stop(when + 8); // safety net
+
+    this.gainNodes = this.gainNodes || new Map();
+    const key = `\( {note}: \){channel}`;
+    this.gainNodes.set(key, gain);
+  }
+
+  releaseNote(note, channel, when = this.audioContext.currentTime) {
+    const key = `\( {note}: \){channel}`;
+    const gain = this.gainNodes?.get(key);
+    if (!gain) return;
+
+    gain.gain.cancelScheduledValues(when);
+    gain.gain.setValueAtTime(gain.gain.value, when);
+    gain.gain.linearRampToValueAtTime(0, when + 0.16);
+    this.gainNodes.delete(key);
+  }
+}
+
+// ────────────────────────────────────────────────
+// UI Wiring
+// ────────────────────────────────────────────────
+
+const player = new SimpleMidiPlayer();
+
+document.getElementById('startAudioBtn').addEventListener('click', async () => {
+  const ok = await player.initAudio();
+  const status = document.getElementById('status');
+  if (ok) {
+    status.textContent = "Audio ready ✓";
+    document.getElementById('startAudioBtn').disabled = true;
+    document.getElementById('startAudioBtn').textContent = "Audio Started";
+    document.getElementById('startAudioBtn').style.background = "#10b981";
+  } else {
+    status.textContent = "Audio failed to start";
+  }
+});
+
+document.getElementById('fileInput').addEventListener('change', async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  document.getElementById('status').textContent = "Loading...";
+  await player.loadFile(file);
+});
+
+document.getElementById('playBtn').addEventListener('click', () => {
+  player.play();
+  document.getElementById('status').textContent = "Playing...";
+});
+
+document.getElementById('stopBtn').addEventListener('click', () => {
+  player.stop();
+  document.getElementById('status').textContent = "Stopped";
+});
+</script>
+</body>
+</html>
