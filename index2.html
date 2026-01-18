@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>MIDI Player</title>
+  <style>
+    body {
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      max-width: 720px;
+      margin: 40px auto;
+      padding: 20px;
+      background: #f9fafb;
+      color: #1f2937;
+    }
+    h1 { color: #111827; text-align: center; }
+    .container {
+      background: white;
+      padding: 30px;
+      border-radius: 12px;
+      box-shadow: 0 6px 20px rgba(0,0,0,0.1);
+    }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      margin: 25px 0;
+      justify-content: center;
+    }
+    button {
+      padding: 12px 32px;
+      font-size: 16px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.22s;
+      color: white;
+    }
+    #startAudioBtn { background: #3b82f6; }
+    #startAudioBtn:hover { background: #2563eb; }
+    #playBtn   { background: #10b981; }
+    #playBtn:hover   { background: #059669; }
+    #stopBtn   { background: #ef4444; }
+    #stopBtn:hover   { background: #dc2626; }
+    input[type="file"] {
+      margin: 20px auto;
+      display: block;
+    }
+    #status {
+      text-align: center;
+      margin: 20px 0;
+      font-weight: 500;
+      min-height: 1.5em;
+      color: #4b5563;
+    }
+    .info { 
+      text-align: center; 
+      color: #6b7280; 
+      font-size: 0.95em; 
+      margin-top: 30px; 
+    }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <h1>MIDI Player</h1>
+    
+    <div style="text-align:center; margin-bottom:20px;">
+      <p>Web Audio • sawtooth synth</p>
+    </div>
+
+    <div class="controls">
+      <button id="startAudioBtn">Start Audio (required)</button>
+      <button id="playBtn" disabled>Play</button>
+      <button id="stopBtn" disabled>Stop</button>
+    </div>
+
+    <div style="text-align:center;">
+      <p><strong>Load your .mid / .midi file</strong></p>
+      <input type="file" id="fileInput" accept=".mid,.midi" />
+    </div>
+
+    <div id="status">Ready – start audio first</div>
+    
+  </div>
+<canvas></canvas>
+
+<script>
+let canvas, canvasCtx, w, h;
+
+const initCanvas = () => {
+    canvas = document.querySelector('canvas');
+    canvas.width = canvas.height = w = h = 400;
+    canvasCtx = canvas.getContext('2d');
+    canvasCtx.fillStyle = 'black';
+    canvasCtx.fillRect(0,0,w,h);
+    canvasCtx.lineWidth= 7;
+    
+
+}
+
+const drawNote = (noteNumber) => {
+    
+    const n = noteNumber % 12;
+    const dist = (noteNumber / 128)*160+ 30;
+    const angle = 360/12 * n;
+    canvasCtx.strokeStyle = `hsl(  ${angle} ,100%,50%)`;
+    canvasCtx.shadowBlur = 3.2;
+ canvasCtx.shadowColor = `hsl(  ${angle} ,100%,50%)`;
+    canvasCtx.beginPath();
+    canvasCtx.arc(w/2,h/2, dist, Math.PI*2*(n)/12 ,Math.PI * 2 * (n+1)/12);
+    
+    canvasCtx.stroke()
+    
+}
+
+const eraseNote = (noteNumber) => {
+    canvasCtx.strokeStyle = 'black';
+    canvasCtx.shadowBlur = 0;
+    const n = noteNumber % 12;
+    const dist = (noteNumber / 128)*160+ 30;
+    canvasCtx.beginPath();
+    canvasCtx.arc(w/2,h/2, dist, Math.PI*2*(n)/12 ,Math.PI * 2 * (n+1)/12);
+
+    canvasCtx.stroke()
+    
+}
+
+
+// ────────────────────────────────────────────────
+// MIDI Player
+// ────────────────────────────────────────────────
+
+class SimpleMidiPlayer {
+  constructor() {
+    this.audioContext = null;
+    this.tracks = [];
+    this.microsecondsPerBeat = 500000; // default 120 BPM
+    this.ticksPerBeat = 480;
+    this.playing = false;
+    this.startTime = 0;
+    this.instrument = 'sawtooth';
+    this.transpose = 0;
+    this.gainNodes = new Map();
+    this.attackTime = 0.12;
+    this.decayTime = 0.15;
+    this.releaseTime = 0.2;
+    this.lookahead = 0.80;
+    this.sustainAmplitude = 0.24; // allow some room for mixing many voices, dont use 1.0 unless you really need that for monosynth
+    this.peakAmplitude = 0.3; // allow some room for mixing many voices
+    this.defaultMidiUrl = 'https://cdn.jsdelivr.net/gh/paul-caron/midisynth@78cba3c0f3db70e1a7028528ed11eb48042aa7c0/11%20-%20Goin%20Down%20The%20Fast%20Way.mid'
+  }
+
+  async initAudio() {
+    if (this.audioContext?.state === 'running') return true;
+    initCanvas();
+    this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    await this.audioContext.resume();
+    return this.audioContext.state === 'running';
+  }
+
+  async loadFile(file) {
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      return this.parseAndLoadMidi(arrayBuffer, file.name);
+    } catch (err) {
+      document.getElementById('status').textContent = "Error: " + err.message;
+      console.error(err);
+      return false;
+    }
+  }
+
+  async loadFromUrl(url) {
+    try {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const arrayBuffer = await response.arrayBuffer();
+      return this.parseAndLoadMidi(arrayBuffer, 'Remote demo');
+    } catch (err) {
+      document.getElementById('status').textContent = "Failed to load default: " + err.message;
+      console.error(err);
+      return false;
+    }
+  }
+
+  parseAndLoadMidi(arrayBuffer, sourceName) {
+    const midi = this.parseMidi(arrayBuffer);
+    if (!midi) {
+      document.getElementById('status').textContent = "Invalid MIDI file";
+      return false;
+    }
+
+    this.tracks = midi.tracks;
+    this.ticksPerBeat = midi.header.ticksPerBeat || 480;
+    this.microsecondsPerBeat = 500000;
+
+    // Try to find earliest tempo
+    let earliestTempo = 500000;
+    for (const track of this.tracks) {
+      for (const ev of track.events) {
+        if (ev.tempo && ev.time === 0) {
+          earliestTempo = ev.tempo;
+          break;
+        }
+      }
+    }
+    this.microsecondsPerBeat = earliestTempo;
+
+    for (const track of this.tracks) {
+      track.nextEventIndex = 0;
+    }
+
+    document.getElementById('status').textContent = 
+      `Loaded: ${sourceName} • ${this.tracks.length} tracks • ${this.ticksPerBeat} TPQN`;
+    document.getElementById('playBtn').disabled = false;
+    document.getElementById('stopBtn').disabled = false;
+    
+    return true;
+  }
+
+  parseMidi(buffer) {
+    const view = new DataView(buffer);
+    let pos = 0;
+
+    const readString = (len) => {
+      let s = '';
+      for (let i = 0; i < len; i++) {
+        s += String.fromCharCode(view.getUint8(pos++));
+      }
+      return s;
+    };
+
+    const readUint32 = () => {
+      const v = view.getUint32(pos);
+      pos += 4;
+      return v;
+    };
+
+    const readUint16 = () => {
+      const v = view.getUint16(pos);
+      pos += 2;
+      return v;
+    };
+
+    const readVarLen = () => {
+      let result = 0;
+      let safety = 0;
+      while (true) {
+        if (safety++ > 10) return 0; // prevent infinite varlen on broken files
+        const b = view.getUint8(pos++);
+        result = (result << 7) | (b & 0x7f);
+        if (!(b & 0x80)) break;
+      }
+      return result;
+    };
+
+    if (readString(4) !== 'MThd') throw new Error("Not a MIDI file");
+
+    readUint32(); // header length
+    readUint16(); // format
+    const nTracks = readUint16();
+    const division = readUint16();
+
+    if (division & 0x8000) throw new Error("SMPTE timing not supported");
+    const ticksPerBeat = division;
+
+    const tracks = [];
+
+    for (let t = 0; t < nTracks; t++) {
+      if (readString(4) !== 'MTrk') continue;
+      const trackLen = readUint32();
+      const end = pos + trackLen;
+      const events = [];
+      let time = 0;
+      let runningStatus = 0;
+      let loopSafety = 0;
+
+      while (pos < end && pos < buffer.byteLength) {
+        if (++loopSafety > 1000000) {
+          console.warn("Parser safety limit reached - possible corrupted track");
+          break;
+        }
+
+        const delta = readVarLen();
+        time += delta;
+
+        if (pos >= end) break;
+
+        let status = view.getUint8(pos);
+
+        if (status < 0x80) {
+          if (runningStatus === 0) {
+            pos++; // skip bad byte
+            continue;
+          }
+          status = runningStatus;
+          // do NOT decrement pos - common cause of infinite loop
+        } else {
+          runningStatus = status;
+          pos++;
+        }
+
+        const ev = { time };
+
+        if (status === 0xFF) {
+          const metaType = view.getUint8(pos++);
+          const metaLen = readVarLen();
+          if (metaType === 0x51 && metaLen === 3) {
+            ev.tempo = (view.getUint8(pos) << 16) |
+                       (view.getUint8(pos+1) << 8) |
+                       view.getUint8(pos+2);
+          }
+          pos += metaLen;
+        }
+        else if ((status & 0xF0) === 0x90 || (status & 0xF0) === 0x80) {
+          const note = view.getUint8(pos++);
+          const velocity = view.getUint8(pos++);
+          ev.note = note;
+          ev.velocity = velocity;
+          ev.channel = status & 0x0F;
+
+          if (velocity === 0 || (status & 0xF0) === 0x80) {
+            ev.type = 'noteOff';
+          } else {
+            ev.type = 'noteOn';
+          }
+        }
+        else {
+          const dataLen = this.getDataLen(status);
+          pos += dataLen;
+        }
+
+        if (ev.type || ev.tempo) {
+          events.push(ev);
+        }
+      }
+
+      tracks.push({ events, nextEventIndex: 0 });
+    }
+
+    return { header: { ticksPerBeat }, tracks };
+  }
+
+  getDataLen(status) {
+    const high = status & 0xF0;
+    if (high === 0xC0 || high === 0xD0) return 1;
+    if (high === 0xE0 || high === 0xB0) return 2;
+    return 0;
+  }
+
+  play() {
+    if (this.playing || !this.tracks.length) return;
+    this.playing = true;
+    this.startTime = this.audioContext.currentTime;
+
+    for (const track of this.tracks) {
+      track.nextEventIndex = 0;
+    }
+
+    this.schedule();
+  }
+
+  stop() {
+    this.playing = false;
+    this.gainNodes.forEach(gain => {
+      gain.gain.cancelScheduledValues(this.audioContext.currentTime);
+      gain.gain.linearRampToValueAtTime(0, this.audioContext.currentTime + 0.12);
+    });
+    this.gainNodes.clear();
+  }
+
+  schedule() {
+    let lookahead = this.lookahead
+    if (!this.playing) return;
+
+    const now = this.audioContext.currentTime;
+    const deadline = now + lookahead;
+    const secPerTick = this.microsecondsPerBeat / 1_000_000 / this.ticksPerBeat;
+
+    for (const track of this.tracks) {
+      while (track.nextEventIndex < track.events.length) {
+        const ev = track.events[track.nextEventIndex];
+        const evTime = this.startTime + ev.time * secPerTick;
+
+        if (evTime > deadline) break;
+
+        if (ev.tempo) {
+          this.microsecondsPerBeat = ev.tempo;
+        } else if (ev.type === 'noteOn' && ev.velocity > 0) {
+          this.playNote(ev.note, ev.velocity, ev.channel, evTime);
+        } else if (ev.type === 'noteOff') {
+          this.releaseNote(ev.note, ev.channel, evTime);
+        }
+
+        track.nextEventIndex++;
+      }
+    }
+
+    setTimeout(() => this.schedule(lookahead), 35);
+  }
+
+  playNote(note, velocity, channel, when) {
+    
+    const transposed = note + this.transpose;
+    if (transposed < 0 || transposed > 127 || channel == 9) return;
+    
+    setTimeout(()=>{drawNote(transposed)}, when +this.lookahead*1000) 
+
+    const freq = 440 * Math.pow(2, (transposed - 69) / 12);
+
+    const osc = this.audioContext.createOscillator();
+    osc.type = this.instrument;
+    osc.frequency.setValueAtTime(freq, when);
+
+    const gain = this.audioContext.createGain();
+    gain.gain.setValueAtTime(0, when);
+    gain.gain.linearRampToValueAtTime(velocity/127 * this.peakAmplitude, when + this.attackTime);
+    gain.gain.linearRampToValueAtTime(velocity/127 * this.sustainAmplitude, when + this.decayTime);
+
+    osc.connect(gain);
+    gain.connect(this.audioContext.destination);
+
+    osc.start(when);
+    osc.stop(when + 8);
+
+    const key = `${transposed}: ${channel}`;
+    this.gainNodes.set(key, gain);
+  }
+
+  releaseNote(note, channel, when = this.audioContext.currentTime) {
+    const transposed = note + this.transpose;
+    if (transposed < 0 || transposed > 127 || channel == 9) return;
+    setTimeout(()=>{eraseNote(transposed)}, when + this.lookahead*1000 ) 
+    
+    const key = `${transposed}: ${channel}`;
+    const gain = this.gainNodes.get(key);
+    if (!gain) return;
+
+    gain.gain.cancelScheduledValues(when);
+    gain.gain.setValueAtTime(gain.gain.value, when);
+    gain.gain.linearRampToValueAtTime(0, when + this.releaseTime);
+    this.gainNodes.delete(key);
+  }
+}
+
+// ────────────────────────────────────────────────
+// UI
+// ────────────────────────────────────────────────
+
+const player = new SimpleMidiPlayer();
+
+document.getElementById('startAudioBtn').addEventListener('click', async () => {
+  const ok = await player.initAudio();
+  if (ok) {
+    await player.loadFromUrl(player.defaultMidiUrl)
+    document.getElementById('status').textContent = "Audio ready ✓ Load your file";
+    document.getElementById('startAudioBtn').disabled = true;
+    document.getElementById('startAudioBtn').textContent = "Audio Started";
+    document.getElementById('startAudioBtn').style.background = "#10b981";
+  } else {
+    document.getElementById('status').textContent = "Audio failed to start";
+  }
+});
+
+document.getElementById('fileInput').addEventListener('change', async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  document.getElementById('status').textContent = "Loading file...";
+  await player.loadFile(file);
+});
+
+document.getElementById('playBtn').addEventListener('click', () => {
+  player.play();
+  document.getElementById('status').textContent = "Playing...";
+});
+
+document.getElementById('stopBtn').addEventListener('click', () => {
+  player.stop();
+  document.getElementById('status').textContent = "Stopped";
+});
+</script>
+</body>
+</html>
